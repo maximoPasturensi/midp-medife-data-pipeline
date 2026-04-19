@@ -1,0 +1,369 @@
+# =============================================================================
+# MIDP — Medifé Intelligent Data Pipeline
+# Archivo: .github/workflows/midp_pipeline.yml
+# Orquestación: GitHub Actions CI/CD
+#
+# Triggers:
+#   - Push a main/develop (validación + tests)
+#   - Cron diario 06:00 UTC (ejecución productiva)
+#   - Manual (workflow_dispatch) para reruns controlados
+# =============================================================================
+
+name: MIDP — CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'requirements*.txt'
+
+  pull_request:
+    branches: [main]
+
+  schedule:
+    # Ejecución productiva: lunes a viernes 06:00 UTC (03:00 ART)
+    - cron: '0 6 * * 1-5'
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Entorno destino'
+        required: true
+        default: 'staging'
+        type: choice
+        options: [staging, production]
+      use_mock:
+        description: 'Usar datos sintéticos'
+        required: false
+        default: 'true'
+        type: boolean
+
+# Permisos mínimos (principio de least privilege)
+permissions:
+  contents: read
+  id-token: write   # Para Workload Identity Federation con GCP
+
+# Cancelar runs anteriores del mismo branch (evitar concurrencia sucia)
+concurrency:
+  group: midp-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.11'
+  JAVA_VERSION: '11'          # Requerido por PySpark
+  GCP_PROJECT_ID: medife-data-project
+  GCS_BUCKET: medife-midp-landing
+  BQ_DATASET: medife_dw
+  GCP_REGION: southamerica-east1
+
+# =============================================================================
+# JOB 1: Linting y análisis estático
+# =============================================================================
+jobs:
+  lint:
+    name: Code Quality — Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Instalar dependencias de desarrollo
+        run: pip install -r requirements-dev.txt
+
+      - name: Ruff — linting ultrarrápido
+        run: ruff check src/ tests/ --output-format=github
+
+      - name: Black — verificación de formato
+        run: black --check --diff src/ tests/
+
+      - name: MyPy — verificación de tipos
+        run: mypy src/midp/ --ignore-missing-imports --strict
+
+      - name: Bandit — análisis de seguridad estático
+        run: bandit -r src/ -ll --format json --output bandit-report.json
+
+      - name: Upload Bandit report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bandit-security-report
+          path: bandit-report.json
+
+
+# =============================================================================
+# JOB 2: Tests unitarios con PySpark local
+# =============================================================================
+  unit-tests:
+    name: Unit Tests — PySpark Local
+    runs-on: ubuntu-latest
+    needs: lint
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Setup Java ${{ env.JAVA_VERSION }} (requerido por Spark)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Configurar JAVA_HOME para PySpark
+        run: echo "JAVA_HOME=$(java -XshowSettings:vm -version 2>&1 | grep java.home | awk '{print $3}')" >> $GITHUB_ENV
+
+      - name: Ejecutar tests unitarios con cobertura
+        env:
+          PYSPARK_PYTHON: python3
+          MIDP_ENV: test
+        run: |
+          pytest tests/unit/ \
+            --cov=src/midp \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing \
+            --cov-fail-under=80 \
+            --junit-xml=test-results.xml \
+            -v
+
+      - name: Upload resultados de tests
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-test-results
+          path: |
+            test-results.xml
+            coverage.xml
+
+      - name: Publicar resultados de tests en PR
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: github.event_name == 'pull_request'
+        with:
+          files: test-results.xml
+
+
+# =============================================================================
+# JOB 3: Data Quality — validación con datos mock
+# =============================================================================
+  data-quality-check:
+    name: Data Quality — Schema & DQ Validation
+    runs-on: ubuntu-latest
+    needs: unit-tests
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Setup Java + Python
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Ejecutar pipeline con datos mock — validación DQ
+        env:
+          MIDP_ENV: ci
+          USE_MOCK: 'true'
+        run: |
+          python -m midp.transform \
+            --use-mock \
+            --output-dq-report dq-report.json \
+            --fail-on-dq-error
+
+      - name: Verificar reporte DQ
+        run: |
+          python -c "
+          import json, sys
+          with open('dq-report.json') as f:
+              report = json.load(f)
+          failed = [r for r in report if r['overall'] == 'FAIL']
+          if failed:
+              print('DQ FAILURES:', json.dumps(failed, indent=2))
+              sys.exit(1)
+          print('All DQ checks passed:', len(report), 'datasets validated.')
+          "
+
+      - name: Upload DQ report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dq-report
+          path: dq-report.json
+
+
+# =============================================================================
+# JOB 4: Deploy a Staging — rama develop
+# =============================================================================
+  deploy-staging:
+    name: Deploy — Staging (GCP)
+    runs-on: ubuntu-latest
+    needs: data-quality-check
+    if: github.ref == 'refs/heads/develop' || github.event.inputs.environment == 'staging'
+    environment: staging
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Autenticación en GCP — Workload Identity Federation
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_STAGING }}
+
+      - name: Setup Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup Python + dependencias
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Subir artefactos a GCS
+        run: |
+          gcloud storage cp -r src/midp/ \
+            gs://${{ env.GCS_BUCKET }}/staging/code/$(date +%Y%m%d_%H%M%S)/
+
+      - name: Ejecutar pipeline en Dataproc Serverless — Staging
+        run: |
+          gcloud dataproc batches submit pyspark \
+            gs://${{ env.GCS_BUCKET }}/staging/code/latest/transform.py \
+            --batch=midp-staging-${{ github.run_number }} \
+            --project=${{ env.GCP_PROJECT_ID }} \
+            --region=${{ env.GCP_REGION }} \
+            --subnet=default \
+            --py-files=gs://${{ env.GCS_BUCKET }}/staging/code/latest/midp.zip \
+            -- \
+            --environment=staging \
+            --bq-dataset=${{ env.BQ_DATASET }}_staging
+
+      - name: Notificar resultado en Slack
+        if: always()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "*MIDP Staging Deploy* — ${{ job.status == 'success' && '✅ OK' || '❌ FALLÓ' }}\nBranch: `${{ github.ref_name }}`\nRun: ${{ github.run_number }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+
+# =============================================================================
+# JOB 5: Deploy a Producción — rama main
+# =============================================================================
+  deploy-production:
+    name: Deploy — Production (GCP)
+    runs-on: ubuntu-latest
+    needs: [data-quality-check, deploy-staging]
+    if: |
+      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+      github.event.inputs.environment == 'production' ||
+      github.event_name == 'schedule'
+    environment: production   # Requiere aprobación manual en Settings
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Autenticación en GCP — Workload Identity Federation (Prod)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_PROD }}
+
+      - name: Setup Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Aplicar schema BigQuery — DDL idempotente
+        run: |
+          bq query \
+            --project_id=${{ env.GCP_PROJECT_ID }} \
+            --use_legacy_sql=false \
+            --location=${{ env.GCP_REGION }} \
+            "$(cat sql/bigquery_star_schema.sql)"
+
+      - name: Ejecutar pipeline productivo — Dataproc Serverless
+        id: run_pipeline
+        run: |
+          JOB_ID="midp-prod-$(date +%Y%m%d)-${{ github.run_number }}"
+          echo "job_id=$JOB_ID" >> $GITHUB_OUTPUT
+
+          gcloud dataproc batches submit pyspark \
+            gs://${{ env.GCS_BUCKET }}/prod/code/latest/transform.py \
+            --batch=$JOB_ID \
+            --project=${{ env.GCP_PROJECT_ID }} \
+            --region=${{ env.GCP_REGION }} \
+            --subnet=prod-subnet \
+            --kms-key=${{ secrets.GCP_KMS_KEY }} \
+            --properties='spark.executor.memory=8g,spark.executor.cores=4' \
+            -- \
+            --environment=production \
+            --bq-dataset=${{ env.BQ_DATASET }}
+
+      - name: Ejecutar smoke tests post-deploy
+        run: |
+          python scripts/smoke_test_bigquery.py \
+            --project=${{ env.GCP_PROJECT_ID }} \
+            --dataset=${{ env.BQ_DATASET }}
+
+      - name: Crear Release tag
+        if: github.event_name == 'push'
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: pipeline-${{ github.run_number }}
+          release_name: "MIDP Pipeline Run #${{ github.run_number }}"
+          body: |
+            Pipeline ejecutado exitosamente.
+            Job ID: ${{ steps.run_pipeline.outputs.job_id }}
+            Commit: ${{ github.sha }}
+          draft: false
+          prerelease: false
+
+      - name: Notificar resultado final
+        if: always()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "*MIDP PRODUCCIÓN* — ${{ job.status == 'success' && '✅ Completado' || '🚨 FALLO CRÍTICO' }}\nJob: `${{ steps.run_pipeline.outputs.job_id }}`\nCommit: `${{ github.sha }}`"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
