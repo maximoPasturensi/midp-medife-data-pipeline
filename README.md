@@ -215,11 +215,11 @@ Cada push a `develop` dispara hasta Staging. Los merges a `main` requieren aprob
 
 ## Autor
 
-**[Tu nombre]** — Estudiante de Analista Programador · UAI  
+**[Maximo Pasturensi]** — Estudiante de Analista Programador · UAI  
 Experiencia en operaciones de salud, ETL pipelines y análisis de desvíos presupuestarios.
 
-[![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-0077B5)](https://linkedin.com/in/tu-perfil)
-[![GitHub](https://img.shields.io/badge/GitHub-Portfolio-181717)](https://github.com/tu-usuario)
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-0077B5)](https://www.linkedin.com/in/maximo-pasturensi-806820333/)
+[![GitHub](https://img.shields.io/badge/GitHub-Portfolio-181717)](https://github.com/maximoPasturensi)
 
 ---
 
