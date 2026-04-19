@@ -215,7 +215,7 @@ Cada push a `develop` dispara hasta Staging. Los merges a `main` requieren aprob
 
 ## Autor
 
-**[Maximo Pasturensi]** — Estudiante de Analista Programador · UAI  
+**Maximo Pasturensi** — Estudiante de Analista Programador · UAI  
 Experiencia en operaciones de salud, ETL pipelines y análisis de desvíos presupuestarios.
 
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-0077B5)](https://www.linkedin.com/in/maximo-pasturensi-806820333/)
